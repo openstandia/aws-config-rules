@@ -1,0 +1,18 @@
+{
+  "Version": "1.0",
+  "Parameters": {
+    "RuleName": "VPC_SG_OPEN_CHECK",
+    "SourceRuntime": "python3.6",
+    "CodeKey": "VPC_SG_OPEN_CHECK.zip",
+    "InputParameters": "{}",
+    "OptionalParameters": "{\"authorizedVpcIds\": \"\", \"authorizedTags\": \"\"}",
+    "SourceEvents": "AWS::EC2::SecurityGroup",
+    "RuleSets": [
+      "baseline",
+      "rulecriticity:high",
+      "pci",
+      "pci:1.2",
+      "vpc"
+    ]
+  }
+}
