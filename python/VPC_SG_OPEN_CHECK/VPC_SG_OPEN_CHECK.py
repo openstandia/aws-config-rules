@@ -17,7 +17,7 @@ Rule Name:
   VPC_SG_OPEN_CHECK
 
 Description:
-  Checks that the security group with 0.0.0.0/0 of any VPCs allows only certain TCP or UDP traffic (Inbound only). If no ports are provided in the parameters, any security group with inbound 0.0.0.0/0 will be NON_COMPLIANT.
+  Checks that the security group with 0.0.0.0/0 or ::/0 of any VPCs allows only certain VPC or TAG. If no vpcIds or tags are provided in the parameters, any security group with inbound 0.0.0.0/0 or ::/0 will be NON_COMPLIANT.
 
 Trigger:
   Configuration Changes on AWS::EC2::SecurityGroup
@@ -26,52 +26,10 @@ Reports on:
   AWS::EC2::SecurityGroup
 
 Rule Parameters:
-  authorizedTcpPorts (Optional)
-       List of TCP ports authorized to be open to 0.0.0.0/0, separated by comma. Ranges can be defined by dash. Ex: "443,1020-1025"
-  authorizedUdpPorts (Optional)
-       List of UDP ports authorized to be open to 0.0.0.0/0, separated by comma. Ranges can be defined by dash. Ex: "500,1020-1025"
-
-Scenarios:
-  Scenario: 1_evalparam_tcpnotvalid_error
-    Given: authorizedTcpPorts is configured and not valid
-	 Then: Return Error
-
-  Scenario: 2_evalparam_udppnotvalid_error
-    Given: authorizedUdpPorts is configured and not valid
-	 Then: Return Error
-
-  Scenario: 3_evalcompliance_notopen_notapplicable
-	Given: The Security Group has no inbound port open to '0.0.0.0/0'
-	 Then: Return NOT_APPLICABLE
-
-  Scenario: 4_evalcompliance_updopennotauthorized_noncompliant
-	Given: The Security Group has at least 1 UDP inbound port open to '0.0.0.0/0'
-	  And: Open UDP ports not in authorizedUdpPorts
-	 Then: Return NON_COMPLIANT
-
-  Scenario: 5_evalcompliance_tcpopennotauthorized_noncompliant
-	Given: The Security Group has at least 1 TCP inbound port open to '0.0.0.0/0'
-	  And: Open TCP ports not in authorizedTcpPorts
-	 Then: Return NON_COMPLIANT
-
-  Scenario: 6_evalcompliance_tcpnotopen_udpauthorized_compliant
-	Given: The Security Group has at least 1 UDP inbound port open to '0.0.0.0/0'
-	  And: No TCP ports are open to '0.0.0.0/0'
-	  And: Open UDP ports in authorizedUdpPorts
-	 Then: Return COMPLIANT
-
-  Scenario: 7_evalcompliance_udpnotopen_tcpauthorized_compliant
-	Given: The Security Group has at least 1 TCP inbound port open to '0.0.0.0/0'
-	  And: No UDP ports are open to '0.0.0.0/0'
-	  And: Open TCP ports in authorizedTcpPorts
-	 Then: Return COMPLIANT
-
-  Scenario: 8_evalcompliance_udpauthorized_tcpauthorized_compliant
-	Given: The Security Group has at least 1 TCP inbound port open to '0.0.0.0/0'
-	  And: The Security Group has at least 1 UDP inbound port open to '0.0.0.0/0'
-	  And: Open TCP ports in authorizedTcpPorts
-	  And: Open UDP ports in authorizedUdpPorts
-	 Then: Return COMPLIANT
+  authorizedVpcIds (Optional)
+       List of VPC Ids authorized to be open to 0.0.0.0/0 or ::/0, separated by comma. Ex: "vpc-1234abc0,vpc-1234567890abcdef0"
+  authorizedTags (Optional)
+       List of Tags authorized to be open to 0.0.0.0/0 or ::/0, separated by comma. Ex: "key1,value1,key2,value2"
  '''
 
 import json
@@ -99,24 +57,38 @@ CONFIG_ROLE_TIMEOUT_SECONDS = 900
 def evaluate_compliance(event, configuration_item, valid_rule_parameters):
     is_any_open_allowed = False
 
+    vpcId = configuration_item['configuration']['vpcId']
+    tags = configuration_item['tags']
+
     for rule in configuration_item['configuration']['ipPermissions']:
-        rule_range = PortRange(rule.get('fromPort', 0), rule.get('toPort', 65535))
         for ip_range in rule['ipv4Ranges']:
             if not ip_range['cidrIp'] == '0.0.0.0/0':
                 continue
 
             is_any_open_allowed = True
-            protocol = rule['ipProtocol']
 
-            if protocol in ['udp', '-1']:
-                non_compliant_annotation = get_non_compliant_annotation('UDP', 'authorizedUdpPorts', valid_rule_parameters, rule_range)
-                if non_compliant_annotation:
-                    return build_evaluation_from_config_item(configuration_item, 'NON_COMPLIANT', annotation=non_compliant_annotation)
+            if is_authorized_vpcId(vpcId, valid_rule_parameters):
+                continue
 
-            if protocol in ['tcp', '-1']:
-                non_compliant_annotation = get_non_compliant_annotation('TCP', 'authorizedTcpPorts', valid_rule_parameters, rule_range)
-                if non_compliant_annotation:
-                    return build_evaluation_from_config_item(configuration_item, 'NON_COMPLIANT', annotation=non_compliant_annotation)
+            if is_authorized_tag(tags, valid_rule_parameters):
+                continue
+
+            return build_evaluation_from_config_item(configuration_item, 'NON_COMPLIANT', annotation='Not authorized to be open.')
+        
+        if is_any_open_allowed is False:
+            for ip_range in rule['ipv6Ranges']:
+                if not ip_range['cidrIpv6'] == '::/0':
+                    continue
+
+                is_any_open_allowed = True
+
+                if is_authorized_vpcId(vpcId, valid_rule_parameters):
+                    continue
+
+                if is_authorized_tag(tags, valid_rule_parameters):
+                    continue
+
+                return build_evaluation_from_config_item(configuration_item, 'NON_COMPLIANT', annotation='Not authorized to be open.')
 
     if is_any_open_allowed:
         return build_evaluation_from_config_item(configuration_item, 'COMPLIANT')
@@ -124,77 +96,55 @@ def evaluate_compliance(event, configuration_item, valid_rule_parameters):
 
 def evaluate_parameters(rule_parameters):
     valid_rule_parameters = {}
-    if 'authorizedTcpPorts' in rule_parameters:
-        valid_rule_parameters['authorizedTcpPorts'] = evaluate_port(rule_parameters['authorizedTcpPorts'])
-    if 'authorizedUdpPorts' in rule_parameters:
-        valid_rule_parameters['authorizedUdpPorts'] = evaluate_port(rule_parameters['authorizedUdpPorts'])
+    if 'authorizedVpcIds' in rule_parameters:
+        valid_rule_parameters['authorizedVpcIds'] = evaluate_vpcId(rule_parameters['authorizedVpcIds'])
+    if 'authorizedTags' in rule_parameters:
+        valid_rule_parameters['authorizedTags'] = evaluate_tag(rule_parameters['authorizedTags'])
     return valid_rule_parameters
 
-def get_non_compliant_annotation(protocol, parameter_name, valid_rule_parameters, rule_range):
-    if not parameter_name in valid_rule_parameters:
-        return 'No {} port is authorized to be open, according to the {} parameter.'.format(protocol, parameter_name)
-    authorized_ports = valid_rule_parameters[parameter_name]
-    if not rule_range.included_in_one_of_the_ranges(authorized_ports):
-        return 'One or more {} ports ({}) are not in range of the {} parameter ({}).'.format(protocol, rule_range.get_str(), parameter_name, get_str_range_list(authorized_ports))
-    return None
-
-class PortRange:
-    begin = None
-    end = None
-    def __init__(self, from_port=None, to_port=None):
-        if not to_port:
-            to_port = from_port
-        self.begin = from_port
-        self.end = to_port
-
-    def get_str(self):
-        if self.begin == self.end:
-            return str(self.begin)
-        return '{}-{}'.format(self.begin, self.end)
-
-    def included_in_one_of_the_ranges(self, range_list):
-        for port_range in range_list:
-            if port_range.begin <= self.begin <= port_range.end and port_range.begin <= self.end <= port_range.end:
-                return True
+def is_authorized_vpcId(vpcId, valid_rule_parameters):
+    if not 'authorizedVpcIds' in valid_rule_parameters:
         return False
+    return vpcId in valid_rule_parameters['authorizedVpcIds']
 
-def get_str_range_list(range_list):
-    range_str = ''
-    for range_obj in range_list:
-        if not range_str:
-            range_str = range_obj.get_str()
-        else:
-            range_str += ','
-            range_str += range_obj.get_str()
-    return range_str
+def is_authorized_tag(tags, valid_rule_parameters):
+    if not 'authorizedTags' in valid_rule_parameters:
+        return False
+    tagsDict = valid_rule_parameters['authorizedTags']
+    for k, v in tags.items():
+        if k in tagsDict:
+            if v in tagsDict[k]:
+                return True
+    return False
 
-def evaluate_port(ports_string):
-    port_list = [each_port.strip() for each_port in ports_string.split(',')]
+def evaluate_vpcId(vpcIds_string):
+    vpcId_list = [each_vpcId.strip() for each_vpcId in vpcIds_string.split(',')]
 
     return_list = []
-    for port in port_list:
-        entry = PortRange()
-        if '-' in port:
-            indiv_ports = port.split('-')
-            if len(indiv_ports) > 2:
-                raise ValueError('Port ranges must have only 1 dash. Please review "{}".'.format(port))
-            try:
-                entry.begin = int(indiv_ports[0].strip())
-                entry.end = int(indiv_ports[1].strip())
-            except:
-                raise ValueError('Ports must be between 0 and 65535.')
-        else:
-            try:
-                entry.begin = int(port)
-                entry.end = int(port)
-            except:
-                raise ValueError('Ports must be between 0 and 65535.')
-        if entry.begin > entry.end:
-            raise ValueError('Ports must be in order for ranges.')
-        if entry.begin < 0 or entry.begin > 65535 or entry.end < 0 or entry.end > 65535:
-            raise ValueError('Ports must be between 0 and 65535.')
-        return_list.append(entry)
+    for vpcId in vpcId_list:
+        if not vpcId.startswith('vpc-'):
+            raise ValueError('VPC ID must start with "vpc-".')
+        return_list.append(vpcId)
     return return_list
+
+def evaluate_tag(tags_string):
+    tag_list = [each_tag.strip() for each_tag in tags_string.split(',')]
+
+    return_dict = {}
+    tagName = None
+    for i, nameOrValue in enumerate(tag_list):
+        if i % 2 == 0:
+            tagName = nameOrValue 
+        else:
+            if tagName in return_dict:
+                return_dict[tagName].append(nameOrValue)
+            else:
+                return_dict[tagName] = [nameOrValue]
+            tagName = None
+
+    if tagName is not None:
+        raise ValueError('No value of tag "{}".'.format(tagName))
+    return return_dict
 
 ####################
 # Helper Functions #
